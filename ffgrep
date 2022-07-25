@@ -1,0 +1,817 @@
+#!/bin/perl
+use warnings;
+use strict;
+use Getopt::Long qw( :config no_ignore_case bundling pass_through );
+use Term::ANSIColor;
+use List::Util qw( min max );
+use Scalar::Util qw( reftype );
+
+# FOR DEBUGGING:
+#   Use the following to get information as to where $colourStruct, $nextColourStruct and $nextNextColourStruct
+#   are pointing and what text is being looked at.
+#
+# use Data::Dumper
+# $x = $colourStruct->{parent}  # colourStruct should be set to a struct that is located at the base colourStackFrame.
+# < $xx = Data::Dumper->Dump([$x, $colourStruct, $nextColourStruct, $nextNextColourStruct], ['x', 'colourStruct', 'nextColourStruct', 'nextNextColourStruct']); \
+#   $xx =~ s/^(\$colourStruct\s*=[^;]*;)/"$1 ".show_ranges(%$colourStruct)/me; \
+#   $xx =~ s/^(\$nextColourStruct\s*=[^;]*;)/"$1 ".show_ranges(%$nextColourStruct)/me; \
+#   $xx =~ s/^(\$nextNextColourStruct\s*=[^;]*;)/"$1 ".show_ranges(%$nextNextColourStruct)/me; \
+#   $xx =~ s/^[^;]*;\n//; \
+#   print $xx;
+# << print 'subtext  [ ' . $pos  . ', ' . $endPos . ' ) = ' . (defined $pos and defined $endPos ? "'". substr2($$txt, $pos, $endPos) ."'": undef)  . "\n"
+
+my @include;
+my @exclude;
+my $recurse = 0;
+my $color='auto';
+my $useLineNumbers = 0;
+my $contextBefore = 0;
+my $contextAfter = 0;
+GetOptions (
+  "color|colour=s" => \$color,
+  "include=s"      => \@include,
+  "exclude=s"      => \@exclude,
+  "r"              => \$recurse,
+  "n"              => \$useLineNumbers,
+  "A=i"            => \$contextAfter,
+  "B=i"            => \$contextBefore,
+) or die("Error in command line arguments\n");
+
+my $regex = shift @ARGV or die "Regex parameter required";
+my @files = @ARGV;
+
+my $reset      = color('reset');
+my $magenta    = color('magenta');
+my $green      = color('green');
+my $red        = color('red');
+my $bright_red = color('bright_red');
+
+my %colours;
+for my $colour (qw(
+          black           red           green           yellow           blue           magenta           cyan           white
+   bright_black    bright_red    bright_green    bright_yellow    bright_blue    bright_magenta    bright_cyan    bright_white
+       on_black        on_red        on_green        on_yellow        on_blue        on_magenta        on_cyan        on_white
+on_bright_black on_bright_red on_bright_green on_bright_yellow on_bright_blue on_bright_magenta on_bright_cyan on_bright_white)) {
+  $colours{$colour} = color($colour);
+}; 
+my $cbegin     = $bright_red;
+my $cend       = $reset;
+my $seperator = "$magenta------$reset\n";
+
+
+# To allow regex to indicate colour of a match, we'll use a
+# group specifier (?"colour-name"...) where ... is the regex
+# to colourize.  This will be replaced with
+# (?:(?{entering})...(?{leaving})|(?{failed})(?!))
+#
+# Example movements:
+#   Entering, leaving.
+#   Entering, failed.
+#   Entering, entering, leaving, leaving.
+#   Entering, entering, failed, leaving.
+#   Entering, entering, leaving, failed.
+#   Entering, entering, failed, failed.
+#   Entering, leaving, entering, leaving.
+#   Entering, entering, leaving, entering, leaving, leaving.
+#
+# 1. On entering a block, append a colour block to current
+# colour stack frame with colour, current position and ref to
+# current colour stack frame.
+#
+# 2. On leaving block, set last colour block in stack frame
+# to have it's end position and set current stack frame to
+# previous stack frame.
+#
+# 3. On failing block, pop off last colour block in current
+# stack frame and set current stack frame to previous stack
+# frame.
+# 
+# The structure will have to be recursive in order for this
+# to work.
+#
+# colour-struct format:
+#
+#   {
+#    colour => colour-name,
+#    range => [ begin-pos, end-pos ],
+#    stack-frame-parent => colour-stack-frame
+#    stack-frame-parent-index => index
+#    stack-frame-children => colour-stack-frame,
+#   }
+#
+# colour-stack-frame format:
+#
+#   [ { parent-stack => colour-stack-frame, parent-struct => colour-struct }, colour-struct, colour-struct, ... ]
+#
+# In the following example, variables not preceded by an underscore ('_') are colourStackFrames.  Those that are
+# not preceded are colourStructs.
+#
+# _A   = [ {undef, undef},    A,    B,   C, ...] where  A = { parent =   _A, children =   _AA },
+#                                                       B = { parent =   _A, children =   _BB },
+#                                                       C = { parent =   _A, children =   _CC }, ...
+# _AA  = [ {   _A,     A},    AA,  AB,  AC, ...] where AA = { parent =  _AA, children =  _AAA },
+#                                                      AB = { parent =  _AA, children =  _AAB },
+#                                                      AC = { parent =  _AA, children =  _AAC }, ...
+# _BB  = [ {   _A,     B},    BA,  BB,  BC, ...] where BA = { parent =  _BA, children =  _BBA },
+#                                                      BB = { parent =  _BA, children =  _BBB },
+#                                                      BC = { parent =  _BA, children =  _BBC }, ...
+#                                                      ...
+# _AAA = [ {  _AA,    AA},   AAA, AAB, AAC, ...] where AAA = { parent = _AAA, children = _AAAA },
+#                                                      AAB = { parent = _AAA, children = _AAAB },
+#                                                      AAC = { parent = _AAA, children = _AAAC }, ...
+#                                                      ...
+
+sub generate_colourStack(\$$) {
+  my ($txt, $regex) = @_;
+  my $currentColourStackFrame = [ { parent_stack => undef, parent_struct => undef } ];
+  my $parentColourStruct;
+
+  my sub enteringBlock {
+    my ($colour) = @_;
+    my $currentColour = {
+      colour       =>   $colour,
+      range        => [ $+[0] ],
+      parent       =>   $currentColourStackFrame,
+      parent_index => $#$currentColourStackFrame + 1,
+      children     => [ { parent_stack => $currentColourStackFrame } ],
+    };
+    $parentColourStruct = $currentColour->{children}->[0]->{parent_struct} = $currentColour;
+    push @$currentColourStackFrame, $currentColour;
+    $currentColourStackFrame = $currentColour->{children};
+  };
+
+  my sub leavingBlock {
+    $currentColourStackFrame = $currentColourStackFrame->[0]->{parent_stack}; # leaving
+    $parentColourStruct      = $currentColourStackFrame->[0]->{parent_struct};
+    push @{$currentColourStackFrame->[-1]->{range}}, $+[0];
+  };
+
+  my sub failedBlock {
+    $currentColourStackFrame = $currentColourStackFrame->[0]->{parent_stack}; # failed
+    $parentColourStruct      = $currentColourStackFrame->[0]->{parent_struct};
+    pop @$currentColourStackFrame;
+  };
+
+  # (?:(?{entering})...(?{leaving})|(?{failed})(?!))
+  use re 'eval';
+  # convert user re with colour blocks to perl re
+  while ($regex =~ s/
+    \(\?(?<colourName>"[^"]++") # colour name
+    (?<regex>
+      (?:[^()\\]++              # not parenthisis or backslash
+       | \(\#(?:                # comment block (?#...)
+         [^\\()]++        # not close paren or backslash
+       | \\.              # escaped character
+      )*+\)
+       | \\.                    # escaped character
+       | \((?&regex)\)          # nested group
+      )*+
+    )\) # end of colour name group
+    /(?:(?{ enteringBlock($+{colourName}) })$+{regex}(?{ leavingBlock() })|(?{ failedBlock() })(?!))/sxg)
+  {}
+  $regex = "(?:(?{ enteringBlock('default') })$regex(?{ leavingBlock() })|(?{ failedBlock() })(?!))";
+  my $regex_re = qr/$regex/;
+  while ($$txt =~ /$regex_re/g) {}
+  return $currentColourStackFrame;
+}
+
+sub match_positions($$) {
+    my ($regex, $string) = @_;
+    return if not $string =~ /$regex/;
+    return ($-[0], $+[0]);
+}
+
+sub match_all_positions($$) {
+    my ($regex, $string) = @_;
+    my @ret;
+    while ($string =~ /$regex/g) {
+        push @ret, [ $-[0], $+[0] ];
+    }
+    return \@ret
+}
+
+sub generate_lineRanges($) {
+  my $ranges = match_all_positions(qr/[^\r\n]*(?:\r\n?|\n\r?|$)/, shift);
+  pop @$ranges if @$ranges and $ranges->[-1]->[0] == $ranges->[-1]->[1];
+  return $ranges;
+}
+
+# Calls a function expecting $a and $b rather than a parameter list.
+sub abCall(&$$) {
+  no strict 'refs';
+  my $pkg = caller;
+  local *{ $pkg . '::a' } = \$_[1];
+  local *{ $pkg . '::b' } = \$_[2];
+  $_[0]->();
+}
+
+# finds the index of where the left insertion point of $findValue in a sorted array is to be.
+sub find_binLeftInsertPoint(&\@$;$$) {
+  my ($spaceship, $array, $findValue, $begin, $end) = @_;
+  $begin = defined $begin ? $begin : 0;
+  $end   = defined $end   ? $end   : scalar @$array - 1;
+
+  ($begin <= $end)        or die "begin ($begin) >= end ($end)";
+  (0 <= $begin)           or die "0 > begin ($begin)";
+  ($end < scalar @$array) or die "end ($end) >= " . scalar(@$array);
+
+  no strict 'refs';
+  my $pkg = caller;
+  local *{ $pkg . '::b' } = \$findValue;
+
+  while ($begin <= $end) {
+    my $partition = $begin + int(($end - $begin) / 2);
+    
+    0 <= $partition and $partition < scalar(@$array) or die("Out of bounds 0 > $partition or $partition >= " . scalar(@$array));
+    local *{ $pkg . '::a' } = \$array->[$partition];
+    if (my $diff = $spaceship->() < 0) {
+      $begin = $partition + 1;
+    } else {
+      $end = $partition - 1;
+    }
+  }
+  return $begin;
+}
+
+
+# Find array index who's element is >= $findValue.
+# Translated from https://en.cppreference.com/w/cpp/algorithm/lower_bound
+sub find_lowerBound(&\@$;$$) {
+  my ($less, $array, $findValue, $begin, $end) = @_;
+  $begin = defined $begin ? $begin : 0;
+  $end   = defined $end   ? $end   : scalar @$array;
+
+  my $middle;
+  my $half;
+  my $length = $end - $begin;
+      while ($length > 0) {
+    $middle = $begin;
+    $half = int($length / 2);
+    $middle += $half;
+    if (abCall(\&$less, $array->[$middle], $findValue) < 0) {
+        $begin = $middle;
+        ++$begin;
+        $length -= $half + 1;
+    }
+    else {
+        $length = $half;
+      }
+  }
+  return $middle;
+}
+
+# Find the index where the element in the array is greater or equal to $findValue or
+# $begin - 1 if none found.
+sub find_binGreaterEqual(&\@$;$$) {
+  my ($pred, $array, $findValue, $begin, $end) = @_;
+  @$array > 0 or die "Empty range list";
+
+  $begin = defined $begin ? $begin : 0;
+  $end   = defined $end   ? $end   : scalar @$array-1;
+  
+  my $index = find_binLeftInsertPoint \&$pred, @$array, $findValue, $begin, $end;
+  #my $index = find_lowerBound \&$pred, @$array, $findValue, $begin, $end;
+  if ($index == @$array or abCall(\&$pred, $array->[$index], $findValue) != 0) {
+    --$index;
+  }
+  ($begin-1 <= $index) and $index <= $end or die "index has invalid range";
+  return $index;
+}
+
+#  Returns the index of the range who's begin <= findCharIndex. 
+sub find_lineIndex_for_char(\@$) {
+  my ($ranges, $findCharIndex) = @_;
+  #return find_lowerBound { $a->[0] <=> $b } @$ranges, $findCharIndex;
+  return find_binGreaterEqual { $a->[0] <=> $b } @$ranges, $findCharIndex;
+}
+
+#  Returns the index of the colour-struct who's range->begin <= findCharIndex. 
+#  If there are none, then return 0.  Because a stack frame has an implicit item pointing
+#  at the parent frame, a found index implies a return value > 0.
+# Return next child (who doesn't have any grandchildren or who's first grandchild begin != child's begin) or undef if none exist.
+sub colourStruct_nextChild(\%) {
+  my $colourStruct = shift;
+  my $nextColourStruct = $colourStruct->{children}->[1];
+  if (defined $nextColourStruct) {
+    $colourStruct->{range}->[0] != $nextColourStruct->{range}->[0] or die "Child has same begin as its parent which is not possible";
+    my $pos = $nextColourStruct->{range}->[0];
+    my $nextNextColourStruct = $nextColourStruct->{children}->[1];
+    while (defined $nextNextColourStruct and $nextNextColourStruct->{range}->[0] == $pos) {
+      $nextColourStruct = $nextNextColourStruct;
+      $nextNextColourStruct = $nextColourStruct->{children}->[1];
+    } 
+  }
+  print "colourStruct_nextChild returns ".(defined $nextColourStruct ? $nextColourStruct : 'undef')."\n"; return ($nextColourStruct ? $nextColourStruct : undef);
+}
+
+# Return next sibling (who's begin != initial's end and is not empty) or undef if none exist.
+sub colourStruct_nextSibling(\%) {
+  my $colourStruct = shift;
+  my $pos = $colourStruct->{range}->[1];
+  my $nextColourStruct = $colourStruct->{parent}->[$colourStruct->{parent_index} + 1];
+  if (defined $nextColourStruct) {
+    # now skip over any empty colourStructs that start at $pos (No gap between $colourStruct and $nextColourStruct)
+    while (defined $nextColourStruct and $nextColourStruct->{range}->[1] == $pos) {
+      $nextColourStruct = $colourStruct->{parent}->[$colourStruct->{parent_index} + 1];
+    }
+    
+    if (defined $nextColourStruct) {
+      $pos = $nextColourStruct->{range}->[1];
+      # now skip over any empty colourStructs that start at $pos (Gap between $colourStruct and $nextColourStruct)
+      while (defined $nextColourStruct and $nextColourStruct->{range}->[1] == $pos) {
+        $nextColourStruct = $colourStruct->{parent}->[$colourStruct->{parent_index} + 1];
+      }
+    }    
+  }
+  print "colourStruct_nextSibling returns ".(defined $nextColourStruct ? $nextColourStruct : 'undef')."\n"; return ($nextColourStruct ? $nextColourStruct : undef);
+}
+
+sub colourStruct_parent(\%) {
+  my $colourStruct = shift;
+  return $colourStruct->{parent}->[0]->{parent_struct};
+}
+
+# return next colourStruct who's end is > initial colourStruct's end or undef if not available.
+sub colourStruct_nextParent(\%) {
+  my $colourStruct = shift;
+  my $lastPos = $colourStruct->{range}->[1];
+  my $nextColourStruct = colourStruct_parent %$colourStruct;
+  my $nextNextColourStruct;
+  while (defined $nextColourStruct and $nextColourStruct->{range}->[1] == $lastPos) {
+    # Has parent
+    $nextNextColourStruct = colourStruct_nextSibling %$nextColourStruct;
+    if (!defined $nextNextColourStruct) {
+      # Parent does NOT have sibling. Go to grandparent.
+      $nextColourStruct = colourStruct_parent %$nextColourStruct;
+    } else {
+      # Parent has sibling
+      $nextColourStruct = $nextNextColourStruct;
+      while (defined $nextNextColourStruct and $nextNextColourStruct->{range}->[1] == $lastPos) {
+        # Go as far right across siblings as possible
+        $nextColourStruct = $nextNextColourStruct;
+        $nextNextColourStruct = colourStruct_nextSibling %$nextColourStruct;
+      }
+    }
+  }
+  print "return $nextColourStruct\n"; return $nextColourStruct;
+}
+
+sub colourStruct_next(\%) {
+  my $colourStruct = shift;
+  my $result = colourStruct_nextChild(%$colourStruct);
+  $result = colourStruct_nextSibling(%$colourStruct) if !defined $result;
+  $result = colourStruct_nextParent(%$colourStruct)  if !defined $result;
+  
+  if ($#{$colourStruct->{children}}) {
+    # next colourStruct is a child element
+    $colourStruct = $colourStruct->{children}->[1];
+  } else {
+    # Next colourStruct is a sibling or parent sibling or grandparent sibling or ... element.
+    # Find parent that has a sibling to it's right.
+    while (defined $colourStruct and $colourStruct->{parent_index} >= $#{$colourStruct->{parent}}) {
+      $colourStruct = $colourStruct->{parent}->[0]->{parent_s  truct};
+    }
+    if (defined $colourStruct) {
+      $colourStruct = $colourStruct->{parent}->[$colourStruct->{parent_index}+1];
+    }
+  }
+  return $colourStruct;
+}
+
+sub find_colourStackIndex_for_char(\@$) {
+  my ($baseStackFrame, $findCharIndex) = @_;
+  return find_binGreaterEqual { $a->{range}->[0] <=> $b } @$baseStackFrame, $findCharIndex, 1;
+}
+
+# Returns the colour-struct who's range->begin <= fimdCharIndex.  If one doesn't
+# exist, returns the left most colour-struct in the tree and if that doesn't exist, return undef.
+sub find_colourStruct_for_char(\%$) {
+  my ($colourStruct, $findCharIndex) = @_;
+
+  # get the current stack frame that can contain $findCharIndex.
+  my $frame = $colourStruct->{parent};
+  # Go up towards root until find a colourStruct who's range encompass $findCharIndex.
+  # $colourStruct will point at the struct who's range->[0] <= $findCharIndex < range->[1] or undef if none exist.
+  while (($findCharIndex < $colourStruct->{range}->[0] or $colourStruct->{range}->[1] <= $findCharIndex) # in range
+    and defined($colourStruct->{parent}->[0]->{parent_struct})) # has parent colourStruct to go to
+  {
+    $colourStruct = $colourStruct->{parent}->[0]->{parent_struct};
+  }
+  defined $colourStruct or die "colourStruct is undefined";
+  
+  if (!defined $colourStruct->{parent}->[0]->{parent_struct}) {
+    # struct is in top stack frame.  Select the struct who's range covers $findCharIndex.
+    defined($colourStruct->{parent}) or die "No parent stack to go to";
+    my $colourStructIndex = find_colourStackIndex_for_char @{$colourStruct->{parent}}, $findCharIndex;
+    if ($colourStructIndex == 0) {
+      $colourStruct = undef; # before first colourStruct element
+    } elsif ($colourStruct->{parent}->[$colourStructIndex]->{range}->[1] <= $findCharIndex) {
+      $colourStruct = undef; # $findCharIndex not in found colourStruct element range
+    } else { # $findCharIndex is in range
+      $colourStruct = $colourStruct->{parent}->[$colourStructIndex];
+    }
+  }
+
+  # Go down towards leaves until find a colourStruct who's smallest range encompass $findCharIndex and
+  # doesn't have any children or who's left most sibling's lower bound >= $findCharIndex.
+  if (defined $colourStruct and $findCharIndex < $colourStruct->{range}->[1]) {
+    while ($#{$colourStruct->{children}})
+    {
+      $colourStruct->{range}->[0] <= $findCharIndex and $findCharIndex < $colourStruct->{range}->[1]
+        or die "$findCharIndex not within range [$colourStruct->{range}->[0], $colourStruct->{range}->[1])";
+
+      my $colourStructIndex = find_colourStackIndex_for_char @{$colourStruct->{children}}, $findCharIndex;
+      if ($colourStructIndex == 0) {
+        # Didn't find a range that encompasses $findCharIndex in the children stack frame, so
+        # don't have to update $colourStruct as it is already pointing to outer range which
+        # is already within range.
+        last;
+      }
+      elsif ($colourStruct->{children}->[$colourStructIndex]->{range}->[1] <= $findCharIndex) {
+        # Outside of range of returned $colourStruct, so don't have to update $colourStruct as
+        # it is already pointing to outer range which is already within range.
+        last;
+      }
+      $colourStruct = $colourStruct->{children}->[$colourStructIndex];
+    }
+  }
+  return $colourStruct;
+}
+
+sub substr2($$$) {
+  $_[1] <= $_[2] or die "$_[1] <= $_[2] is false";
+  return substr($_[0], $_[1], $_[2]-$_[1]);
+}
+
+sub print_range(\$\@\%\@\%;$$$$) {
+  my ($txt, $range, $colourStruct, $lineRanges, $colourCodes, $filename, $outputLines, $contextBefore, $contextAfter) = @_;
+  my ($line_begin, $line_end)
+           = (find_lineIndex_for_char(@$lineRanges, $range->[0])
+           ,  find_lineIndex_for_char @$lineRanges, $range->[1]);
+           
+  my $oldColour = '';
+  my sub colourise($@) {
+    # NOTE: This doesn't take into consideration if the fg/bg colours are in a different order
+    #       or if multiple fg/bg colours are specified.  Important?
+    if (($#$_ == 1 and length($_[1]) == 0) or ($#$_ == 2 and $_[2] == $_[1])) {
+      # string is empty, nothing to do
+      return '';
+    }
+    my $newColour = '';
+    for my $colour (split /\s+/, $_[0]) {
+      if (defined $colourCodes->{$colour}) {
+        for $colour (split /\s+/, $colourCodes->{$colour}) {
+          $newColour .= color($colour);
+        }
+      } else {
+        $newColour .= color($colour);
+      }
+    }
+    if ($oldColour ne $newColour) {
+      $oldColour = $newColour;
+    } else {
+      $newColour = '';
+    }
+    if ($#$_ == 1) {
+      # colourise a string
+      return $newColour . $_[1];
+    }
+    # colourise a text range
+    return $newColour . substr2($$txt, $_[1], $_[2]);
+  }
+  
+  my $lineLen = length($line_end);
+  for my $line ($line_begin - (defined $contextBefore ? $contextBefore : 0)
+          ..$line_end + (defined $contextAfter ? $contextAfter : 0)) {
+    my $prefix = '';
+    if (defined $filename) {
+      $prefix  = colourise('filename', $filename)
+             .   colourise('colon', ($line_begin <= $line and $line <= $line_end ? ':' : '-'));
+    }
+    if ($outputLines) {
+      $prefix .= colourise('number', sprintf("% *u", $lineLen, $line))
+              .  colourise('colon', ($line_begin <= $line and $line <= $line_end ? ':' : '-'));
+    }
+    my $lineText = '';
+    my $pos = $lineRanges->[$line]->[0];
+    my $endPos = $pos;
+    
+    if ($line <= $line_begin) {
+      $endPos = min($lineRanges->[$line]->[1], $range->[0]);
+      my $str = substr2($$txt, $pos, $endPos);
+      if (defined $contextBefore and length($str) > 0) {
+        $lineText .= colourise('no_match', $str);
+      }
+      $pos = $endPos;
+    }
+
+    if ($line_begin <= $line and $line <= $line_end) {
+      # 01234567
+      #  llllll   l - each char that current line is on
+      #  mmmmmm   m - each char that has magenta associated with it
+      #   rrrrr   r - each char that has red associated with it
+      #   gggy    g,y - each char that has green or yellow associated with it
+      #    cc     c - each char that has cyan associated with it
+      #    bb     b - each char that has blue associated with it
+      #  mgbbyr   final mashup of colours each char is associated with
+      #
+      # pos = 1, cs = m
+      # r2p = [m.b, g.b) = [1, 2)
+      # pos = g.b (2)
+      # r2p = [g.b, c.b -> b.b) = [2, 3)
+      # pos = b.b (3)
+      # r2p = [b.b, b.e) = [3, 5)
+      # pos = b.e (5) -> c.e -> y.b
+      # r2p = [y.b, y.e] = [5, 6)
+      # pos = 6
+      # r2p = [r, r.e)
+
+      sub begin2begin() { 0 };
+      sub begin2end()   { 1 };
+
+      my $colourStruct = find_colourStruct_for_char %$colourStruct, $pos;
+      my $txtRange;
+      while ($pos < $lineRanges->[$line]->[1]) {
+        defined $colourStruct or die "colourStruct is undefined";
+        
+        my $nextColourStruct = $colourStruct;
+        my $nextNextColourStruct = colourStruct_nextChild(%$colourStruct);
+        $nextNextColourStruct = colourStruct_nextSibling(%$colourStruct) if !defined $nextNextColourStruct;
+        if (defined $nextNextColourStruct) {
+          # Found next colourStruct that has a different begin than current.
+          $txtRange = begin2begin;
+          $endPos = min($nextNextColourStruct->{range}->[$txtRange], $lineRanges->[$line]->[1]);
+          $nextColourStruct = $nextNextColourStruct;
+        } else {
+          # Only found next colourStruct that has the same begin than current.
+          $txtRange = begin2end;
+          $endPos = min($nextColourStruct->{range}->[$txtRange], $lineRanges->[$line]->[1]);
+        }
+        
+        if ($colourStruct->{colour} !~ /\bhide\b/) {
+          $lineText .= colourise($colourStruct->{colour}, $pos, $endPos);
+        }
+        
+        $pos = $endPos;
+        if ($txtRange == begin2end and $pos < $lineRanges->[$line]->[1]) {
+          # If there's a next colourStruct sibling and it's begin is greater than colourStruct's end,
+          # then print that range the colour of the parent colourStruct.
+          $nextColourStruct = colourStruct_nextSibling(%$colourStruct);
+          $nextColourStruct = colourStruct_nextParent(%$colourStruct) if !defined $nextColourStruct;
+          print "nextColourStruct = $nextColourStruct\n";
+          if (defined $nextColourStruct) {
+            if ($colourStruct->{range}->[1] < $nextColourStruct->{range}->[0]) {
+              $endPos = min($nextColourStruct->{range}->[0], $lineRanges->[$line]->[1]);
+              $lineText .= colourise(${colourStruct_parent %$colourStruct}->{colour}
+                                     , $colourStruct->{range}->[1], $endPos);
+            }
+          } else {
+            $nextColourStruct = colourStruct_parent %$colourStruct;
+            if (defined $nextColourStruct and $colourStruct->{range}->[1] < $nextColourStruct->{range}->[1]) {
+              $endPos = min($nextColourStruct->{range}->[1], $lineRanges->[$line]->[1]);
+              $lineText .= colourise($nextColourStruct->{colour}
+                                     , $colourStruct->{range}->[1], $endPos);
+            }
+          }
+          $pos = $endPos;
+        }
+        $colourStruct = $nextColourStruct;
+      }
+    }
+    if ($line_end <= $line) {
+      $endPos = $lineRanges->[$line]->[1];
+      my $str = substr2($$txt, $pos, $endPos);
+      if (defined $contextAfter and length($str) > 0) {
+        $lineText .= colourise('no_match', $str);
+      }
+    }
+    if (length($lineText) > 0) {
+      print "$prefix$lineText\n";
+    }
+  }
+}
+
+sub show_range(\%) {
+  my $colourStruct = shift;
+  return "undef colourStruct" if !defined $colourStruct;
+  my $range = $colourStruct->{range};
+  return "undef range"        if !defined $range;
+  return "[" . (defined $range->[0] ? $range->[0] : 'undef') . ", " . (defined $range->[1] ? $range->[1] : 'undef') . ")"; 
+}
+
+sub show_listOfRanges(\@;$$) {
+  my ($list, $start, $end) = @_;
+  return "undef list" if !defined $list;
+  $start = 1          if !defined $start;
+  $end   = $#$list    if !defined $end;
+  my $s = '[ ';
+  foreach my $csi ($start..$end-1) {
+    $s .= show_range(%{$list->[$csi]}) . ', ';
+  }
+  if ($end - $start >= 0) {
+    $s .= show_range(%{$list->[$end]});
+  }
+  return $s . ' ]';
+}
+
+sub show_ranges(\%) {
+  my $colourStruct = shift;
+  return "undef" if !defined $colourStruct;
+  my $s = show_range(%$colourStruct);
+  $s .= "\n children: ";
+  if (!defined $colourStruct->{children}) {
+    $s .= " Invalid.  Missing parent.";
+  } else {
+    $s .= show_listOfRanges(@{$colourStruct->{children}}, 1);
+  }
+  $s .= "\n siblings: ";
+  if (!defined $colourStruct->{parent}) {
+    $s .= " Invalid.  Missing parent.";
+  }
+  if (!defined $colourStruct->{parent_index}) {
+    $s .= " Invalid.  Missing parent_index.";
+  }
+  if (defined($colourStruct->{parent}) and defined($colourStruct->{parent_index})) {
+    $s .= show_listOfRanges(@{$colourStruct->{parent}}, $colourStruct->{parent_index} + 1);
+  }
+  $s .= "\n parent siblings: ";
+  $colourStruct = $colourStruct->{parent}->[0]->{parent_struct};
+  if (!defined $colourStruct) {
+    $s .= "undef parent struct";
+  } else {
+    if (!defined $colourStruct->{parent}) {
+      $s .= " Invalid.  Missing parent.";
+    }
+    if (!defined $colourStruct->{parent_index}) {
+      $s .= " Invalid.  Missing parent_index.";
+    }
+    if (defined($colourStruct->{parent}) and defined($colourStruct->{parent_index})) {
+      $s .= show_listOfRanges(@{$colourStruct->{parent}}, $colourStruct->{parent_index});
+    }
+  }
+  return $s . "\n";
+}
+
+sub test {
+  if (1) {
+    my $txt = "abc\n\ndef";
+    my @lineRanges = @{generate_lineRanges $txt};
+    my $value;
+    ($value = find_lineIndex_for_char(@lineRanges, 0)) == 0 or die('TEST: found a on line '  . $value . ' instead of line 0');
+    ($value = find_lineIndex_for_char(@lineRanges, 1)) == 0 or die('TEST: found b on line '  . $value . ' instead of line 0');
+    ($value = find_lineIndex_for_char(@lineRanges, 2)) == 0 or die('TEST: found c on line '  . $value . ' instead of line 0');
+    ($value = find_lineIndex_for_char(@lineRanges, 3)) == 0 or die('TEST: found \n on line ' . $value . ' instead of line 0');
+    ($value = find_lineIndex_for_char(@lineRanges, 4)) == 1 or die('TEST: found \n on line ' . $value . ' instead of line 1');
+    ($value = find_lineIndex_for_char(@lineRanges, 5)) == 2 or die('TEST: found d on line '  . $value . ' instead of line 2');
+    ($value = find_lineIndex_for_char(@lineRanges, 6)) == 2 or die('TEST: found e on line '  . $value . ' instead of line 2');
+    ($value = find_lineIndex_for_char(@lineRanges, 7)) == 2 or die('TEST: found f on line '  . $value . ' instead of line 2');
+  }
+  if (1) {
+    #                         111 1111111222222222233333333334444444444555
+    #               0123456789012 3456789012345678901234567890123456789012
+    my $expected = "UdddrgggbbbbbbbbbgggrdddrgggbbbbbgggrdrgggbbbbbgggrdddUU";
+    my $txt      = "} a { b { c \n d } e } f { g { h } i } { j { k } l } m { ";
+    my $regex = '[^{}]*(?"red"\{(?"green"[^{}]*(?"blue"\{[^{}]*\})[^{}}]*)\})+[^{}]*';
+    my $colourStackFrame = generate_colourStack $txt, $regex;
+    my $lineRanges = generate_lineRanges $txt;
+    my $colours = '';
+    for my $index (0..length($txt)-1) {
+      my $colourIndex = find_colourStackIndex_for_char @$colourStackFrame, $index;
+      print "$colourIndex";
+      print "\n" if substr($txt, $index, 1) eq "\n";
+    }
+    print "\n";
+    for my $index (0..length($txt)-1) {
+      my $colourStruct = find_colourStruct_for_char %{$colourStackFrame->[1]}, $index;
+      my $colour;
+      if (!defined $colourStruct) {
+        # before any colour
+        $colour = 'Not matched';
+        $colours .= 'U';
+      } else {
+        ($colourStruct->{range}->[0] <= $index and $index < $colourStruct->{range}->[1])
+              or die "Index ($index) not in range [$colourStruct->{range}->[0], $colourStruct->{range}->[1])"; 
+        $colour = $colourStruct->{colour};
+        $colours .= substr $colour, 0, 1;
+      }
+      print "[$index] = ".substr($txt, $index, 1)." $colour ";
+      for (my $struct = $colourStruct; defined $colourStruct; $colourStruct = $colourStruct->{parent}->[0]->{parent_struct}) {  
+        my $colourIndex = find_colourStackIndex_for_char @$colourStackFrame, $index;
+        my $i = $colourStruct->{parent_index};
+        print " -> $i";
+      }
+      print "\n";
+    }
+    $expected eq $colours or die "Didn't get expected colours";
+    print "\n$txt\n$expected\n$colours\n";
+
+    my %colourCodes = (
+      filename => 'magenta',
+      colon    => 'green',
+      no_match => 'reset',
+      default  => 'red',
+    );
+    print "-"x79, "\n";
+    for my $i (1..$#$colourStackFrame) {
+      my $colourStruct = $colourStackFrame->[$i];
+      print_range $txt, @{$colourStruct->{range}}, %$colourStruct, @$lineRanges, %colourCodes;
+    }
+  }
+}
+test();
+exit 0;
+
+sub getRange($\$) {
+  my ($txt, $range) = @_;
+  substr($$txt, $range->[0], $range->[1] - $range->[0]);
+}
+
+sub setRange($\$$) {
+  my ($txt, $range, $value) = @_;
+  substr($$txt, $range->[0], $range->[1] - $range->[0], $value);
+}
+
+my $regex_re = qr/$regex/m;
+foreach my $fileIndex (0..$#files) {
+  my $file = $files[$fileIndex];
+  # open file
+  if (open my $fh, '<', $file) {
+    # slurp it in
+    $/ = undef;
+    my $txt = <$fh>;
+    close $fh;
+  
+    # char index range that a line holds
+    my @lineCharRange = @{generate_lineRanges($txt)};
+    # line numbers that match
+    my @linesMatched;
+    # char index range that matches $regex_re
+    my @matches = @{match_all_positions($regex_re, $txt)};
+
+    next if !@matches;
+
+    # TODO: join matches that have overlapping lines
+    my @matchesGroups = ([ $matches[0] ]);
+    foreach my $rangeIndex (1..$#matches) {
+      if (max($#lineCharRange, find_lineIndex_for_char(@lineCharRange, $matches[$rangeIndex-1]->[1]) + $contextAfter)
+               >= min(0, find_lineIndex_for_char(@lineCharRange, $matches[$rangeIndex]->[0]) - $contextBefore)) {
+        push @{$matchesGroups[-1]}, $matches[$rangeIndex];
+      } else {
+        push @matchesGroups, [ $matches[$rangeIndex] ];
+      }
+    }
+
+    # perform regex
+    foreach my $rangeIndex (0..$#matches) {
+      my $range = $matches[$rangeIndex];
+      my $matchCharIndex_begin = $range->[0];
+      my $matchCharIndex_end   = $range->[1];
+      my $matchLineIndex_begin = find_lineIndex_for_char(@lineCharRange, $matchCharIndex_begin);
+      my $matchLineIndex_end   = find_lineIndex_for_char(@lineCharRange, $matchCharIndex_end  );
+      my $lineIndex_begin      = max(              0, $matchLineIndex_begin - $contextBefore);
+      my $lineIndex_end        = min($#lineCharRange, $matchLineIndex_end   + $contextAfter);
+      my $lineCharIndex_begin  = $lineCharRange[$lineIndex_begin]->[0];
+      my $lineCharIndex_end    = $lineIndex_end+1 > $#lineCharRange
+                     ? $lineCharRange[$lineIndex_end  ]->[1]  # last char of this line
+              : $lineCharRange[$lineIndex_end+1]->[0]; # first char of next line
+      
+      my $charForLine = sub { my $line = shift; (($matchLineIndex_begin < $line and $line-1 <= $matchLineIndex_end) ? ":" : "-"); };
+      my $lineLen = $lineCharIndex_end - $lineCharIndex_begin;
+      # my $lineStr = getRange($txt, 
+      my $lineStr = substr($txt, $lineCharIndex_begin, $lineLen);
+      $matchCharIndex_begin -= $lineCharIndex_begin;
+      $matchCharIndex_end   -= $lineCharIndex_begin;
+      my $matchLen = $matchCharIndex_end - $matchCharIndex_begin;
+      my $matchStr = substr($lineStr, $matchCharIndex_begin, $matchLen);
+
+      # color the eniter $matchStr, but color each line separately
+      $matchStr =~ s/\G([^\r\n]*)(\r\n?|\n\r?|$)/$cbegin$1$cend$2/g;
+      
+      # replace matched with coloured matched
+      substr($lineStr, $matchCharIndex_begin, $matchCharIndex_end - $matchCharIndex_begin, $matchStr);
+
+      # add line numbers to each line
+      if ($useLineNumbers) {
+        my $line = $lineIndex_begin;
+        $lineStr =~ s/^/
+          ++$line;
+                 (@files > 1 ? '' : $green) . $line . $charForLine->($line) . "$reset"
+        /egm;
+      }
+
+      # add file name to each line
+      if (@files > 1) {
+        # more than one file is present.  Need to distinguish which are which.
+        my $filePrefix = "$magenta$file";
+        my $line = $lineIndex_begin;
+        $lineStr =~ s/^/
+          ++$line;
+                 "$filePrefix$green" . $charForLine->($line) . ($useLineNumbers ? '' : $reset)
+        /egm;
+      }
+
+      print $lineStr;
+    }
+    # print $seperator if $fileIndex != $#files and @matches;
+  } 
+}
